@@ -743,6 +743,21 @@ ProcessImmediately:
     return 0;
 }
 
+static int discard_field_block(h2o_http2_conn_t *conn, const uint8_t *src, size_t len, const char **err_desc)
+{
+    h2o_mem_pool_t pool;
+    h2o_headers_t headers = {NULL};
+    size_t dummy_content_length;
+    h2o_iovec_t dummy_expect = h2o_iovec_init(NULL, 0);
+    int ret;
+
+    h2o_mem_init_pool(&pool);
+    ret = h2o_hpack_parse_request(&pool, h2o_hpack_decode_header, &conn->_input_header_table, NULL, NULL, NULL, NULL, NULL,
+                                  &headers, NULL, &dummy_content_length, &dummy_expect, NULL, src, len, err_desc);
+    h2o_mem_clear_pool(&pool);
+    return ret;
+}
+
 static int handle_trailing_headers(h2o_http2_conn_t *conn, h2o_http2_stream_t *stream, const uint8_t *src, size_t len,
                                    const char **err_desc)
 {
@@ -770,6 +785,28 @@ static ssize_t expect_continuation_of_headers(h2o_http2_conn_t *conn, const uint
     if (frame.type != H2O_HTTP2_FRAME_TYPE_CONTINUATION) {
         *err_desc = "expected CONTINUATION frame";
         return H2O_HTTP2_ERROR_PROTOCOL;
+    }
+
+    if ((stream = h2o_http2_conn_get_stream(conn, frame.stream_id)) == NULL && (frame.stream_id & 1) != 0 &&
+        frame.stream_id <= conn->pull_stream_ids.max_open) {
+        if (conn->_headers_unparsed->size + frame.length > H2O_MAX_REQLEN) {
+            *err_desc = "field block on a closed stream is too large";
+            return H2O_HTTP2_ERROR_ENHANCE_YOUR_CALM;
+        }
+        h2o_buffer_reserve(&conn->_headers_unparsed, frame.length);
+        memcpy(conn->_headers_unparsed->bytes + conn->_headers_unparsed->size, frame.payload, frame.length);
+        conn->_headers_unparsed->size += frame.length;
+        if ((frame.flags & H2O_HTTP2_FRAME_FLAG_END_HEADERS) != 0) {
+            conn->_read_expect = expect_default;
+            hret =
+                discard_field_block(conn, (const uint8_t *)conn->_headers_unparsed->bytes, conn->_headers_unparsed->size, err_desc);
+            h2o_buffer_dispose(&conn->_headers_unparsed);
+            conn->_headers_unparsed = NULL;
+            if (hret != 0)
+                return hret;
+            stream_send_error(conn, frame.stream_id, H2O_HTTP2_ERROR_STREAM_CLOSED);
+        }
+        return ret;
     }
 
     if ((stream = h2o_http2_conn_get_stream(conn, frame.stream_id)) == NULL ||
@@ -1044,8 +1081,14 @@ static int handle_headers_frame(h2o_http2_conn_t *conn, h2o_http2_frame_t *frame
     }
     if (frame->stream_id <= conn->pull_stream_ids.max_open) {
         if ((stream = h2o_http2_conn_get_stream(conn, frame->stream_id)) == NULL) {
-            *err_desc = "closed stream id in HEADERS frame";
-            return H2O_HTTP2_ERROR_STREAM_CLOSED;
+            /* the stream has already been closed; the block still has to be decoded and discarded, because the HPACK
+             * dynamic table is shared by all the streams of the connection */
+            if ((frame->flags & H2O_HTTP2_FRAME_FLAG_END_HEADERS) == 0)
+                goto PREPARE_FOR_CONTINUATION;
+            if ((ret = discard_field_block(conn, payload.headers, payload.headers_len, err_desc)) != 0)
+                return ret;
+            stream_send_error(conn, frame->stream_id, H2O_HTTP2_ERROR_STREAM_CLOSED);
+            return 0;
         }
         if (!(stream->req_body.state == H2O_HTTP2_REQ_BODY_OPEN_BEFORE_FIRST_FRAME ||
               stream->req_body.state == H2O_HTTP2_REQ_BODY_OPEN)) {
